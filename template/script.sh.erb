@@ -1,0 +1,598 @@
+#!/usr/bin/env bash
+
+# NOTE: We intentionally don't use 'set -e' globally because we want to handle 
+# errors gracefully in many places. Critical sections use explicit error checking.
+
+# OOD session output dir. This is where connection.yml must live.
+SESSION_ROOT="$(pwd)"
+SESSION_UUID="$(basename "${SESSION_ROOT}")"
+
+# Stable pointer location in user home
+OOD_STATE_DIR="${HOME}/.ood/cryosparc"
+ACTIVE_PTR="${OOD_STATE_DIR}/active_connection_path"
+
+mkdir -p "${OOD_STATE_DIR}"
+
+echo "==========================================="
+echo "  CryoSPARC Starting"
+echo "  User: ${USER}"
+echo "  Date: $(date)"
+echo "  Script PID: $$"
+echo "  Session root: ${SESSION_ROOT}"
+echo "  Session uuid: ${SESSION_UUID}"
+echo "==========================================="
+
+# Write pointer immediately so view can always locate the right file
+echo "${SESSION_ROOT}/connection.yml" > "${ACTIVE_PTR}"
+chmod 600 "${ACTIVE_PTR}" || true
+
+# Helper. atomic write connection.yml in session dir
+write_connection_yml() {
+  local status="$1"
+  local host_fqdn="$2"
+  local host_short="$3"
+  local web_port="$4"
+  local data_dir="$5"
+  local project_dir="$6"
+  local gpus="$7"
+
+  local tmp="${SESSION_ROOT}/connection.yml.tmp"
+  cat > "${tmp}" << EOF
+---
+status: "${status}"
+session_uuid: "${SESSION_UUID}"
+written_at: "$(date -Is)"
+host: "${host_fqdn}"
+hostname_short: "${host_short}"
+port: "${web_port}"
+data_dir: "${data_dir}"
+project_dir: "${project_dir}"
+gpus: "${gpus}"
+user: "${USER}"
+EOF
+  mv -f "${tmp}" "${SESSION_ROOT}/connection.yml"
+}
+
+# Write an initial "starting" record so the view never shows stale data
+HOST_FQDN="$(hostname -f 2>/dev/null || hostname)"
+HOST_SHORT="$(hostname -s 2>/dev/null || hostname)"
+[[ "$HOST_FQDN" != *.* ]] && HOST_FQDN="${HOST_SHORT}.cm.cluster"
+
+# Port allocation (same as before)
+get_user_base_port() {
+    local username="$1"
+    local hash
+    hash=$(echo -n "$username" | md5sum | cut -c1-4)
+    local hash_int=$((16#$hash))
+    local port_offset=$((hash_int % 2000))
+    echo $((40000 + (port_offset * 10)))
+}
+BASE_PORT=$(get_user_base_port "${USER}")
+WEB_PORT="${BASE_PORT}"
+
+# Form variables
+LICENSE_ID="<%= context.license_id.to_s.strip %>"
+USER_DATA_DIR="<%= context.cryosparc_data_dir.to_s.strip %>"
+PROJECT_DIR="<%= context.project_dir.to_s.strip %>"
+USER_EMAIL="<%= context.email.to_s.strip %>"
+FORM_PASSWORD="<%= context.password.to_s.strip %>"
+
+# If user_data_dir is empty in the form, define a sane default
+if [ -z "${USER_DATA_DIR}" ]; then
+  USER_DATA_DIR="/lustre/nvwulf/scratch/${USER}/cryosparc_data"
+fi
+if [ -z "${PROJECT_DIR}" ]; then
+  PROJECT_DIR="/lustre/nvwulf/scratch/${USER}/cryosparc_projects"
+fi
+
+# ============================================================
+# VALIDATION: Check for required fields
+# ============================================================
+USER_DB_DIR="${USER_DATA_DIR}/database"
+FRESH_INSTALL=false
+if [ ! -f "${USER_DB_DIR}/WiredTiger" ]; then
+  FRESH_INSTALL=true
+fi
+
+# License ID is required for fresh installs
+if [ "${FRESH_INSTALL}" = true ] && [ -z "${LICENSE_ID}" ]; then
+    echo ""
+    echo "=============================================="
+    echo "  ERROR: License ID Required"
+    echo "=============================================="
+    echo "  This is your first time running CryoSPARC."
+    echo "  You must provide your personal License ID."
+    echo ""
+    echo "  Get a FREE academic license at:"
+    echo "  https://cryosparc.com/download"
+    echo "=============================================="
+    exit 1
+fi
+
+# Email is required for fresh installs
+if [ "${FRESH_INSTALL}" = true ] && [ -z "${USER_EMAIL}" ]; then
+    echo ""
+    echo "=============================================="
+    echo "  ERROR: Email Required"
+    echo "=============================================="
+    echo "  This is your first time running CryoSPARC."
+    echo "  You must provide an email address for login."
+    echo "=============================================="
+    exit 1
+fi
+
+GPU_COUNT=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l || echo "0")
+
+write_connection_yml "starting" "${HOST_FQDN}" "${HOST_SHORT}" "${WEB_PORT}" "${USER_DATA_DIR}" "${PROJECT_DIR}" "${GPU_COUNT}"
+
+echo "Pointer written: ${ACTIVE_PTR}"
+echo "Initial connection.yml written: ${SESSION_ROOT}/connection.yml"
+
+# ------------------------------------------------------------
+# SHARED INSTALLATION PATH (read-only for users)
+# ------------------------------------------------------------
+export CRYOSPARC_ROOT="/lustre/nvwulf/software/cryosparc/4.7.1"
+SHARED_MASTER_DIR="${CRYOSPARC_ROOT}/cryosparc_master"
+SHARED_WORKER_DIR="${CRYOSPARC_ROOT}/cryosparc_worker"
+
+# Verify shared installation exists
+if [ ! -d "${SHARED_MASTER_DIR}" ]; then
+    echo ""
+    echo "=============================================="
+    echo "  ERROR: CryoSPARC Installation Not Found"
+    echo "=============================================="
+    echo "  Expected: ${SHARED_MASTER_DIR}"
+    echo "  Please contact your system administrator."
+    echo "=============================================="
+    exit 1
+fi
+
+# ------------------------------------------------------------
+# PER-USER INSTANCE DIRECTORY (using symlinks for speed!)
+# This creates a lightweight per-user structure where most
+# content is symlinked to the shared installation, but
+# certain directories that need write access are COPIED:
+#   - bin/           (scripts that resolve paths)
+#   - run/           (logs and PIDs) 
+#   - deps_hashes/   (install.sh writes hash files here)
+# And these are CREATED fresh:
+#   - config.sh      (per-user configuration)
+# ------------------------------------------------------------
+USER_INSTANCE_DIR="${USER_DATA_DIR}/cryosparc_instance"
+USER_MASTER_DIR="${USER_INSTANCE_DIR}/cryosparc_master"
+USER_WORKER_DIR="${USER_INSTANCE_DIR}/cryosparc_worker"
+
+# List of directories/files that MUST be writable (copied, not symlinked)
+# Add any new directories here if you encounter permission errors
+WRITABLE_DIRS="bin run deps_hashes"
+SKIP_FILES="config.sh"
+
+echo ""
+echo "=============================================="
+echo "  Setting up per-user CryoSPARC instance"
+echo "=============================================="
+echo "  Shared installation: ${CRYOSPARC_ROOT}"
+echo "  User instance: ${USER_INSTANCE_DIR}"
+echo "  Fresh install: ${FRESH_INSTALL}"
+echo "=============================================="
+
+# Function to check if item should be copied (writable) instead of symlinked
+should_copy() {
+    local item_name="$1"
+    for dir in ${WRITABLE_DIRS}; do
+        if [ "${item_name}" = "${dir}" ]; then
+            return 0  # true, should copy
+        fi
+    done
+    return 1  # false, should symlink
+}
+
+# Function to check if item should be skipped entirely (we create it ourselves)
+should_skip() {
+    local item_name="$1"
+    for f in ${SKIP_FILES}; do
+        if [ "${item_name}" = "${f}" ]; then
+            return 0  # true, should skip
+        fi
+    done
+    return 1  # false, should not skip
+}
+
+# Function to create a symlinked directory structure
+create_symlinked_instance() {
+    local src_dir="$1"
+    local dst_dir="$2"
+    local dir_name
+    dir_name=$(basename "$src_dir")
+    
+    echo "Creating symlinked instance of ${dir_name}..."
+    
+    # Create the destination directory
+    mkdir -p "${dst_dir}"
+    
+    # Use find to get all items (handles spaces and special chars better)
+    find "${src_dir}" -maxdepth 1 -mindepth 1 | while read -r item; do
+        local item_name
+        item_name=$(basename "$item")
+        local dst_item="${dst_dir}/${item_name}"
+        
+        # Skip if already exists
+        if [ -e "${dst_item}" ] || [ -L "${dst_item}" ]; then
+            continue
+        fi
+        
+        # Check if we should skip this item entirely
+        if should_skip "${item_name}"; then
+            echo "  Skipping ${item_name} (will create custom)"
+            continue
+        fi
+        
+        # Check if this needs to be copied (writable) or symlinked
+        if should_copy "${item_name}"; then
+            if [ -d "${item}" ]; then
+                echo "  Copying ${item_name}/ directory"
+                cp -r "${item}" "${dst_item}"
+            else
+                echo "  Copying ${item_name} file"
+                cp "${item}" "${dst_item}"
+            fi
+        else
+            # Symlink everything else
+            ln -s "${item}" "${dst_item}"
+        fi
+    done
+    
+    # Ensure run directory exists even if not in source
+    mkdir -p "${dst_dir}/run"
+    
+    echo "  Instance created in ${dst_dir}"
+}
+
+# Function to verify and fix an existing instance
+verify_and_fix_instance() {
+    local src_dir="$1"
+    local dst_dir="$2"
+    local dir_name
+    dir_name=$(basename "$src_dir")
+    
+    echo "Verifying ${dir_name} instance..."
+    
+    # Ensure run directory exists
+    mkdir -p "${dst_dir}/run"
+    
+    # Check all items that should be copied (not symlinked)
+    for dir_name in ${WRITABLE_DIRS}; do
+        local src_item="${src_dir}/${dir_name}"
+        local dst_item="${dst_dir}/${dir_name}"
+        
+        # Skip if source doesn't exist
+        [ -e "${src_item}" ] || continue
+        
+        # Fix if it's a symlink (should be a real copy)
+        if [ -L "${dst_item}" ]; then
+            echo "  Fixing ${dir_name}/ (was symlink, needs to be writable)..."
+            rm -f "${dst_item}"
+            if [ -d "${src_item}" ]; then
+                cp -r "${src_item}" "${dst_item}"
+            else
+                cp "${src_item}" "${dst_item}"
+            fi
+        elif [ ! -e "${dst_item}" ]; then
+            echo "  Creating missing ${dir_name}/..."
+            if [ -d "${src_item}" ]; then
+                cp -r "${src_item}" "${dst_item}"
+            else
+                cp "${src_item}" "${dst_item}"
+            fi
+        fi
+    done
+    
+    # Check for any missing symlinks and create them
+    find "${src_dir}" -maxdepth 1 -mindepth 1 | while read -r item; do
+        local item_name
+        item_name=$(basename "$item")
+        local dst_item="${dst_dir}/${item_name}"
+        
+        # Skip items we handle specially
+        if should_skip "${item_name}" || should_copy "${item_name}"; then
+            continue
+        fi
+        
+        # Create symlink if missing
+        if [ ! -e "${dst_item}" ] && [ ! -L "${dst_item}" ]; then
+            echo "  Adding missing symlink: ${item_name}"
+            ln -s "${item}" "${dst_item}"
+        fi
+        
+        # Check for broken symlinks and fix them
+        if [ -L "${dst_item}" ] && [ ! -e "${dst_item}" ]; then
+            echo "  Fixing broken symlink: ${item_name}"
+            rm -f "${dst_item}"
+            ln -s "${item}" "${dst_item}"
+        fi
+    done
+}
+
+# Create or verify per-user master directory
+if [ ! -d "${USER_MASTER_DIR}" ]; then
+    create_symlinked_instance "${SHARED_MASTER_DIR}" "${USER_MASTER_DIR}"
+else
+    echo "Using existing per-user master directory"
+    verify_and_fix_instance "${SHARED_MASTER_DIR}" "${USER_MASTER_DIR}"
+fi
+
+# Create or verify per-user worker directory
+if [ ! -d "${USER_WORKER_DIR}" ]; then
+    create_symlinked_instance "${SHARED_WORKER_DIR}" "${USER_WORKER_DIR}"
+else
+    echo "Using existing per-user worker directory"
+    verify_and_fix_instance "${SHARED_WORKER_DIR}" "${USER_WORKER_DIR}"
+fi
+
+# Now use the per-user directories
+export CRYOSPARC_MASTER_DIR="${USER_MASTER_DIR}"
+export CRYOSPARC_WORKER_DIR="${USER_WORKER_DIR}"
+export PATH="${CRYOSPARC_MASTER_DIR}/bin:${CRYOSPARC_WORKER_DIR}/bin:${PATH}"
+
+MASTER_DIR="${CRYOSPARC_MASTER_DIR}"
+WORKER_DIR="${CRYOSPARC_WORKER_DIR}"
+
+echo ""
+echo "=============================================="
+echo "  AGGRESSIVE CLEANUP: Killing all CryoSPARC"
+echo "=============================================="
+
+cd "${MASTER_DIR}" 2>/dev/null && ./bin/cryosparcm stop 2>/dev/null || true
+pkill -9 -u "${USER}" -f "cryosparc_master/bin" 2>/dev/null || true
+pkill -9 -u "${USER}" -f "cryosparc_worker/bin" 2>/dev/null || true
+pkill -9 -u "${USER}" -f "cryosparc_compute" 2>/dev/null || true
+pkill -9 -u "${USER}" -f "cryosparcm" 2>/dev/null || true
+pkill -9 -u "${USER}" -f "cryosparcw" 2>/dev/null || true
+pkill -9 -u "${USER}" -f "mongod.*cryosparc" 2>/dev/null || true
+pkill -9 -u "${USER}" -f "supervisord.*cryosparc" 2>/dev/null || true
+sleep 3
+
+rm -f /tmp/cryosparc-supervisor-*.sock 2>/dev/null || true
+rm -f "${HOME}/.cryosparc/"*.sock 2>/dev/null || true
+rm -f "${USER_DATA_DIR}/database/mongod.lock" 2>/dev/null || true
+rm -f "${USER_DATA_DIR}/database/WiredTiger.lock" 2>/dev/null || true
+rm -f "${USER_MASTER_DIR}/run/"*.pid 2>/dev/null || true
+rm -f "${USER_MASTER_DIR}/run/"*.sock 2>/dev/null || true
+
+echo "Cleanup complete"
+echo ""
+
+echo "=============================================="
+echo "  Port Allocation for user '${USER}'"
+echo "=============================================="
+echo "  Base Port:  ${BASE_PORT}"
+echo "  Web UI:     Port ${WEB_PORT}"
+echo "=============================================="
+
+echo "Checking if ports are available..."
+for port in ${BASE_PORT} $((BASE_PORT+1)) $((BASE_PORT+2)); do
+    if ss -tuln 2>/dev/null | grep -q ":${port} "; then
+        echo "WARNING: Port ${port} still in use, waiting..."
+        sleep 5
+    fi
+done
+echo "Ports ready!"
+
+SSD_CACHE="/lustre/nvwulf/scratch/${USER}/cryosparc_cache"
+mkdir -p "${USER_DATA_DIR}" "${USER_DB_DIR}" "${PROJECT_DIR}" "${SSD_CACHE}"
+
+# Create the per-user config.sh in the user's master directory
+# This is the key file that install.sh tries to write to!
+cat > "${USER_MASTER_DIR}/config.sh" << EOF
+export CRYOSPARC_LICENSE_ID="${LICENSE_ID}"
+export CRYOSPARC_MASTER_HOSTNAME="${HOST_FQDN}"
+export CRYOSPARC_DB_PATH="${USER_DB_DIR}"
+export CRYOSPARC_BASE_PORT=${BASE_PORT}
+export CRYOSPARC_DEVELOP=false
+export CRYOSPARC_INSECURE=true
+export CRYOSPARC_FORCE_HOSTNAME=true
+export CRYOSPARC_FORCE_USER=true
+EOF
+
+# Also create config.sh for the worker
+cat > "${USER_WORKER_DIR}/config.sh" << EOF
+export CRYOSPARC_LICENSE_ID="${LICENSE_ID}"
+export CRYOSPARC_MASTER_HOSTNAME="${HOST_FQDN}"
+export CRYOSPARC_DB_PATH="${USER_DB_DIR}"
+export CRYOSPARC_BASE_PORT=${BASE_PORT}
+export CRYOSPARC_DEVELOP=false
+export CRYOSPARC_INSECURE=true
+export CRYOSPARC_FORCE_HOSTNAME=true
+export CRYOSPARC_FORCE_USER=true
+EOF
+
+# Export all the environment variables
+export CRYOSPARC_LICENSE_ID="${LICENSE_ID}"
+export CRYOSPARC_MASTER_HOSTNAME="${HOST_FQDN}"
+export CRYOSPARC_DB_PATH="${USER_DB_DIR}"
+export CRYOSPARC_BASE_PORT=${BASE_PORT}
+export CRYOSPARC_DEVELOP=false
+export CRYOSPARC_INSECURE=true
+export CRYOSPARC_FORCE_HOSTNAME=true
+export CRYOSPARC_FORCE_USER=true
+
+cleanup() {
+  echo "Shutting down CryoSPARC..."
+  cd "${MASTER_DIR}" 2>/dev/null || true
+  ./bin/cryosparcm stop 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+cd "${MASTER_DIR}"
+
+if [ "${FRESH_INSTALL}" = true ]; then
+  echo "First-time setup..."
+  echo ""
+  echo "=============================================="
+  echo "  IMPORTANT: Your data will be stored at:"
+  echo "  Database: ${USER_DB_DIR}"
+  echo "  Projects: ${PROJECT_DIR}"
+  echo "  These persist between sessions!"
+  echo "=============================================="
+
+  if [ -n "${FORM_PASSWORD}" ]; then
+    INITIAL_PASSWORD="${FORM_PASSWORD}"
+  else
+    INITIAL_PASSWORD=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
+  fi
+
+  # Status update only
+  write_connection_yml "db" "${HOST_FQDN}" "${HOST_SHORT}" "${WEB_PORT}" "${USER_DATA_DIR}" "${PROJECT_DIR}" "${GPU_COUNT}"
+  sleep 2
+  
+  # Run install.sh from the user's symlinked master directory
+  # Now it can write to config.sh and deps_hashes since they're in user's space!
+  if ! ./install.sh --standalone \
+    --license "${LICENSE_ID}" \
+    --hostname "${HOST_FQDN}" \
+    --dbpath "${USER_DB_DIR}" \
+    --port "${BASE_PORT}" \
+    --worker_path "${WORKER_DIR}" \
+    --ssdpath "${SSD_CACHE}" \
+    --initial_email "${USER_EMAIL}" \
+    --initial_password "${INITIAL_PASSWORD}" \
+    --initial_username "${USER}" \
+    --initial_firstname "${USER}" \
+    --initial_lastname "User" \
+    --yes; then
+    echo ""
+    echo "=============================================="
+    echo "  ERROR: CryoSPARC installation failed!"
+    echo "=============================================="
+    echo "  Check the output above for details."
+    echo "  Common issues:"
+    echo "  - Invalid license ID"
+    echo "  - Permission denied errors (report to admin)"
+    echo "  - Network connectivity issues"
+    echo "=============================================="
+    exit 1
+  fi
+
+  cat > "${USER_DATA_DIR}/credentials.txt" << EOF
+============================================
+CryoSPARC Login Credentials
+Created: $(date)
+============================================
+Email:    ${USER_EMAIL}
+Password: ${INITIAL_PASSWORD}
+============================================
+IMPORTANT: Your projects and data persist
+between sessions. They are stored at:
+- Database: ${USER_DB_DIR}
+- Projects: ${PROJECT_DIR}
+============================================
+EOF
+  chmod 600 "${USER_DATA_DIR}/credentials.txt" || true
+
+else
+  echo "Starting existing instance (database persists)..."
+  echo ""
+  echo "=============================================="
+  echo "  Your existing data will be loaded from:"
+  echo "  Database: ${USER_DB_DIR}"
+  echo "  Projects: ${PROJECT_DIR}"
+  echo "=============================================="
+
+  # Status update only
+  write_connection_yml "db" "${HOST_FQDN}" "${HOST_SHORT}" "${WEB_PORT}" "${USER_DATA_DIR}" "${PROJECT_DIR}" "${GPU_COUNT}"
+
+  if ! ./bin/cryosparcm start; then
+    echo ""
+    echo "=============================================="
+    echo "  WARNING: CryoSPARC start returned an error"
+    echo "  Attempting to continue anyway..."
+    echo "=============================================="
+  fi
+fi
+
+# Status update only
+write_connection_yml "master" "${HOST_FQDN}" "${HOST_SHORT}" "${WEB_PORT}" "${USER_DATA_DIR}" "${PROJECT_DIR}" "${GPU_COUNT}"
+
+echo "Waiting for CryoSPARC web interface to start..."
+sleep 1
+# Status update only
+write_connection_yml "app" "${HOST_FQDN}" "${HOST_SHORT}" "${WEB_PORT}" "${USER_DATA_DIR}" "${PROJECT_DIR}" "${GPU_COUNT}"
+sleep 2
+
+STARTUP_TIMEOUT=300
+STARTUP_COUNTER=0
+while [ ${STARTUP_COUNTER} -lt ${STARTUP_TIMEOUT} ]; do
+  if curl -sf "http://localhost:${WEB_PORT}/" > /dev/null 2>&1; then
+    echo "CryoSPARC is ready! (took ${STARTUP_COUNTER} seconds)"
+    break
+  fi
+  STARTUP_COUNTER=$((STARTUP_COUNTER + 1))
+  sleep 1
+done
+
+if ! curl -sf "http://localhost:${WEB_PORT}/" > /dev/null 2>&1; then
+  echo ""
+  echo "=============================================="
+  echo "  ERROR: CryoSPARC did not come up"
+  echo "=============================================="
+  echo "  Waited ${STARTUP_TIMEOUT} seconds."
+  echo "  Check logs at: ${USER_MASTER_DIR}/run/"
+  echo ""
+  echo "  Useful commands to debug:"
+  echo "  cat ${USER_MASTER_DIR}/run/command_core.log"
+  echo "  cat ${USER_MASTER_DIR}/run/database.log"
+  echo "=============================================="
+  exit 1
+fi
+
+# Now overwrite connection.yml with status ready and final values
+GPU_LIST=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | tr '\n' ',' | sed 's/,$//' || echo "")
+GPU_COUNT=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l || echo "0")
+
+write_connection_yml "ready" "${HOST_FQDN}" "${HOST_SHORT}" "${WEB_PORT}" "${USER_DATA_DIR}" "${PROJECT_DIR}" "${GPU_COUNT}"
+echo "Ready connection.yml written: ${SESSION_ROOT}/connection.yml"
+sleep 2
+echo "Connecting worker..."
+
+# Status update only
+write_connection_yml "worker" "${HOST_FQDN}" "${HOST_SHORT}" "${WEB_PORT}" "${USER_DATA_DIR}" "${PROJECT_DIR}" "${GPU_COUNT}"
+sleep 2
+cd "${WORKER_DIR}"
+./bin/cryosparcw connect \
+  --worker "${HOST_FQDN}" \
+  --master "${HOST_FQDN}" \
+  --port "${BASE_PORT}" \
+  --ssdpath "${SSD_CACHE}" \
+  --lane "local" \
+  --gpus "${GPU_LIST}" \
+  --newlane 2>/dev/null || \
+./bin/cryosparcw connect \
+  --worker "${HOST_FQDN}" \
+  --master "${HOST_FQDN}" \
+  --port "${BASE_PORT}" \
+  --ssdpath "${SSD_CACHE}" \
+  --lane "local" \
+  --gpus "${GPU_LIST}" \
+  --update 2>/dev/null || true
+
+# Return to ready for UI
+write_connection_yml "ready" "${HOST_FQDN}" "${HOST_SHORT}" "${WEB_PORT}" "${USER_DATA_DIR}" "${PROJECT_DIR}" "${GPU_COUNT}"
+sleep 2
+echo ""
+echo "##############################################"
+echo "#    CryoSPARC READY                         #"
+echo "##############################################"
+echo "  Node: ${HOST_FQDN}"
+echo "  Port: ${WEB_PORT}"
+echo "  Credentials: ${USER_DATA_DIR}/credentials.txt"
+echo "  Instance Dir: ${USER_INSTANCE_DIR}"
+echo ""
+echo "  YOUR DATA PERSISTS BETWEEN SESSIONS:"
+echo "  - Database: ${USER_DB_DIR}"
+echo "  - Projects: ${PROJECT_DIR}"
+echo "##############################################"
+
+while true; do
+  sleep 300
+done
+

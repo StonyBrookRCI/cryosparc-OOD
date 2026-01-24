@@ -1,0 +1,104 @@
+cluster: "nvwulf"
+
+attributes:
+  queue:
+    widget: "select"
+    label: "Queue"
+    help: "Select the GPU queue. CryoSPARC requires GPU access for processing."
+    options:
+      - ["Regular b40x4 (max 8h)", "b40x4"]
+      - ["Long b40x4 (max 48h)", "b40x4-long"]
+    value: "b40x4"
+
+  bc_num_hours:
+    widget: "number_field"
+    label: "Number of hours"
+    help: "How long to run CryoSPARC. Your database/projects persist after session ends."
+    value: 8
+    min: 1
+    max: 48
+    step: 1
+
+  memory_gb:
+    widget: "select"
+    label: "Memory (GB)"
+    help: "RAM for CryoSPARC. 64GB minimum, 128GB+ recommended."
+    options:
+      - ["64", "64"]
+      - ["128", "128"]
+      - ["256", "256"]
+      - ["480", "480"]
+      - ["All available", "0"]
+    value: "128"
+
+  num_gpus:
+    widget: "select"
+    label: "Number of GPUs"
+    help: "GPUs for processing. More GPUs = faster parallel processing."
+    options:
+      - ["1", "1"]
+      - ["2", "2"]
+      - ["3", "3"]
+      - ["4", "4"]
+    value: "2"
+
+  num_cpus:
+    widget: "number_field"
+    label: "Number of CPU cores"
+    help: "CPU cores for CryoSPARC. 8+ recommended."
+    value: 16
+    min: 4
+    max: 64
+    step: 1
+
+  license_id:
+    widget: "text_field"
+    label: "Your CryoSPARC License ID"
+    help: "YOUR personal license ID (required). Get FREE at https://cryosparc.com/download"
+    value: ""
+
+  cryosparc_data_dir:
+    widget: "text_field"
+    label: "CryoSPARC Data Directory"
+    help: "Where YOUR database and config are stored. Persists between sessions."
+    value: "/lustre/nvwulf/scratch/<%= ENV['USER'] %>/cryosparc_data"
+
+  project_dir:
+    widget: "text_field"
+    label: "Default Project Directory"
+    help: "Default location for YOUR CryoSPARC projects."
+    value: "/lustre/nvwulf/scratch/<%= ENV['USER'] %>/cryosparc_projects"
+
+  email:
+    label: "Email address"
+    help: "For CryoSPARC account (use same email as license registration)."
+    widget: text_field
+    value: ""
+
+  password:
+    label: "CryoSPARC Password"
+    help: "Set your CryoSPARC login password (auto-generated if left empty)."
+    widget: text_field
+    value: ""
+
+  bc_email_on_started:
+    label: "Email me when job starts"
+    widget: check_box
+    checked_value: true
+    unchecked_value: false
+    value: false
+
+form:
+  - queue
+  - bc_num_hours
+  - memory_gb
+  - num_gpus
+  - num_cpus
+  - license_id
+  - cryosparc_data_dir
+  - project_dir
+  - email
+  - password
+  - bc_email_on_started
+
+submit: "Launch CryoSPARC"

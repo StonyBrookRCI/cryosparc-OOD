@@ -1,0 +1,6 @@
+---
+name: "CryoSPARC"
+category: "Interactive Apps"
+subcategory: "Science"
+role: "batch_connect"
+description: "Launch CryoSPARC for cryo-EM data processing. Requires personal license (free for academics)."

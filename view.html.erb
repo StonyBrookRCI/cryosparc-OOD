@@ -1,0 +1,529 @@
+<%
+require "yaml"
+require "etc"
+
+def s(x); (x || "").to_s; end
+def present?(x); !s(x).strip.empty?; end
+
+uid = Process.uid
+home_dir = begin
+  Etc.getpwuid(uid).dir
+rescue
+  ENV["HOME"].to_s
+end
+
+ptr = File.join(home_dir, ".ood", "cryosparc", "active_connection_path")
+
+conn_path = nil
+begin
+  if File.exist?(ptr)
+    conn_path = File.read(ptr).to_s.strip
+  end
+rescue
+  conn_path = nil
+end
+
+conn = {}
+begin
+  if present?(conn_path) && File.exist?(conn_path)
+    conn = YAML.safe_load(File.read(conn_path)) || {}
+  end
+rescue
+  conn = {}
+end
+
+status      = s(conn["status"])
+host        = s(conn["host"])
+port        = s(conn["port"])
+host_short  = s(conn["hostname_short"])
+data_dir    = s(conn["data_dir"])
+project_dir = s(conn["project_dir"])
+gpus        = s(conn["gpus"])
+
+ready = (status == "ready") && present?(host) && present?(port)
+
+# Friendly labels for startup line under spinner
+status_label = case status
+               when "ready"    then "Ready"
+               when "starting" then "Starting CryoSPARC"
+               when "db"       then "Starting database"
+               when "master"   then "Starting master"
+               when "worker"   then "Registering worker"
+               when "app"      then "Starting web app"
+               else "Initializing"
+               end
+
+username  = ENV["USER"] || (Etc.getpwuid(uid).name rescue "username")
+tunnel_cmd = ready ? "ssh -J #{username}@130.245.181.10 -L #{port}:localhost:#{port} #{username}@#{host}" : ""
+local_url  = ready ? "http://localhost:#{port}/" : ""
+
+creds_file  = present?(data_dir) ? File.join(data_dir, "credentials.txt") : nil
+creds_exist = creds_file && File.exist?(creds_file.to_s)
+%>
+
+<% unless ready %>
+  <meta http-equiv="refresh" content="5">
+<% end %>
+
+<style>
+  .cs-container { max-width: 900px; margin: 0 auto; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  .cs-header { text-align: center; padding: 30px 20px; background: linear-gradient(135deg, #1e3a5f 0%, #2d5a87 100%); border-radius: 12px; margin-bottom: 24px; color: white; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+  .cs-header h2 { margin: 0 0 8px 0; font-size: 28px; font-weight: 600; }
+  .cs-header .subtitle { opacity: 0.9; font-size: 14px; margin: 4px 0 0 0; }
+
+  /* Row holding status pill and help button */
+  .cs-header-row { display: inline-flex; align-items: center; gap: 10px; margin-top: 16px; flex-wrap: wrap; justify-content: center; }
+
+  .cs-status { display: inline-flex; align-items: center; gap: 8px; padding: 8px 16px; border-radius: 20px; font-size: 14px; font-weight: 500; background: rgba(34, 197, 94, 0.15); color: #4ade80; }
+  .cs-status .dot { width: 8px; height: 8px; border-radius: 50%; background: #4ade80; }
+
+  /* Three animated dots inside status pill */
+  .cs-typing { display: inline-flex; align-items: center; gap: 4px; margin-right: 4px; }
+  .cs-typing span { width: 6px; height: 6px; border-radius: 50%; background: #4ade80; opacity: 0.25; animation: cs-bounce 1.2s infinite; }
+  .cs-typing span:nth-child(2) { animation-delay: 0.15s; }
+  .cs-typing span:nth-child(3) { animation-delay: 0.30s; }
+  @keyframes cs-bounce {
+    0%, 80%, 100% { opacity: 0.25; transform: translateY(0); }
+    40% { opacity: 1; transform: translateY(-2px); }
+  }
+
+  .cs-step { background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; margin-bottom: 16px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+  .cs-step-header { display: flex; align-items: center; gap: 14px; padding: 18px 20px; background: #f8fafc; border-bottom: 1px solid #e5e7eb; }
+  .cs-step-number { padding: 7px 16px; background: linear-gradient(135deg, #3b82f6, #1d4ed8); color: white; border-radius: 6px; font-weight: 700; font-size: 14px; flex-shrink: 0; }
+  .cs-step.success .cs-step-number { background: linear-gradient(135deg, #22c55e, #16a34a); }
+  .cs-step-header h4 { margin: 0; font-size: 17px; font-weight: 650; color: #1e293b; }
+  .cs-step-body { padding: 22px; }
+  .cs-step-body p { margin: 0 0 14px 0; color: #475569; font-size: 15px; line-height: 1.7; }
+
+  .cs-code { background: #1e293b; color: #e2e8f0; padding: 14px 16px; border-radius: 8px; font-family: "SF Mono", monospace; font-size: 14px; overflow-x: auto; margin-bottom: 14px; white-space: nowrap; }
+
+  .cs-btn { display: inline-flex; align-items: center; gap: 8px; padding: 13px 26px; border-radius: 9px; font-size: 15px; font-weight: 600; text-decoration: none; cursor: pointer; border: none; transition: all 0.2s; }
+  .cs-btn-primary { background: linear-gradient(135deg, #3b82f6, #1d4ed8); color: white; padding: 14px 30px; font-size: 15px; }
+  .cs-btn-copy { background: #374151; color: white; padding: 8px 14px; font-size: 13px; border-radius: 9px; }
+  .cs-btn-copy.copied { background: #16a34a; }
+
+  .cs-info { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 16px; margin: 16px 0; font-size: 15px; }
+  .cs-creds { background: #fef3c7; border: 1px solid #fcd34d; border-radius: 8px; padding: 16px; margin: 16px 0; font-size: 15px; }
+
+  .cs-loading { text-align: center; padding: 60px 20px; background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; }
+  .cs-spinner { width: 48px; height: 48px; border: 3px solid #e5e7eb; border-top-color: #3b82f6; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 18px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Red status line with animated ellipsis under spinner */
+  .cs-starting-line {
+    margin-top: 6px;
+    font-size: 15px;
+    font-weight: 650;
+    color: #dc2626;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .cs-ellipsis { display: inline-flex; gap: 4px; align-items: center; }
+  .cs-ellipsis span {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #dc2626;
+    opacity: 0.25;
+    animation: cs-ellip 1.2s infinite;
+  }
+  .cs-ellipsis span:nth-child(2) { animation-delay: 0.15s; }
+  .cs-ellipsis span:nth-child(3) { animation-delay: 0.30s; }
+  @keyframes cs-ellip {
+    0%, 80%, 100% { opacity: 0.25; transform: translateY(0); }
+    40% { opacity: 1; transform: translateY(-2px); }
+  }
+
+  /* Help button in header row */
+  .cs-btn-help {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 14px;
+    background: rgba(255,255,255,0.10);
+    border: 1px solid rgba(255,255,255,0.25);
+    border-radius: 20px;
+    color: white;
+    text-decoration: none;
+    font-size: 13px;
+    font-weight: 650;
+    transition: all 0.2s;
+    cursor: pointer;
+    line-height: 1;
+    height: 36px;
+  }
+  .cs-btn-help:hover { background: rgba(255,255,255,0.18); }
+
+  .cs-credits { text-align: center; padding: 24px 20px; margin-top: 24px; border-top: 1px solid #e5e7eb; }
+  .cs-credits p { margin: 0; color: #64748b; font-size: 13px; }
+  .cs-credits a { color: #3b82f6; text-decoration: none; font-weight: 500; }
+  .cs-credits a:hover { text-decoration: underline; color: #2563eb; }
+  .cs-credits-sub { margin-top: 6px !important; font-size: 12px !important; color: #94a3b8 !important; }
+</style>
+
+<div class="cs-container">
+  <% if ready %>
+    <div class="cs-header">
+      <h2>🔬 CryoSPARC</h2>
+      <p class="subtitle">Cryo-EM Data Processing Platform</p>
+
+      <div class="cs-header-row">
+        <div class="cs-status">
+          <span class="dot"></span>
+          <span class="cs-typing" aria-hidden="true">
+            <span></span><span></span><span></span>
+          </span>
+          Running on <%= host_short %>
+        </div>
+
+        <button onclick="openHelpWindow()" class="cs-btn-help">
+          Help & Documentation
+        </button>
+      </div>
+    </div>
+
+    <div class="cs-step">
+      <div class="cs-step-header">
+        <span class="cs-step-number">Step 1</span>
+        <h4>Create SSH Tunnel</h4>
+      </div>
+      <div class="cs-step-body">
+        <p>Open a terminal on your <strong>local computer</strong> and run:</p>
+        <div class="cs-code" id="tunnel-cmd"><%= tunnel_cmd %></div>
+        <button class="cs-btn-copy" onclick="copyCmd()">Copy Command</button>
+      </div>
+    </div>
+
+    <div class="cs-step success">
+      <div class="cs-step-header">
+        <span class="cs-step-number">Step 2</span>
+        <h4>Open CryoSPARC</h4>
+      </div>
+      <div class="cs-step-body">
+        <p>After the SSH tunnel is connected, click:</p>
+        <a href="<%= local_url %>" target="_blank" class="cs-btn cs-btn-primary">Launch CryoSPARC</a>
+
+        <% if creds_exist %>
+          <div class="cs-creds">
+            <strong>Login Credentials</strong><br>
+            Saved at: <code><%= creds_file %></code>
+          </div>
+        <% end %>
+
+        <div class="cs-info">
+          <strong>Your Directories</strong><br><br>
+          <div><strong>Data:</strong> <%= data_dir %></div>
+          <div><strong>Projects:</strong> <%= project_dir %></div>
+          <div><strong>GPUs:</strong> <%= gpus %></div>
+        </div>
+      </div>
+    </div>
+
+  <% else %>
+    <div class="cs-header">
+      <h2>🔬 CryoSPARC</h2>
+      <p class="subtitle">Cryo-EM Data Processing Platform</p>
+
+      <div class="cs-header-row">
+        <button onclick="openHelpWindow()" class="cs-btn-help">
+          Help & Documentation
+        </button>
+      </div>
+    </div>
+
+    <div class="cs-loading">
+      <div class="cs-spinner"></div>
+
+      <div class="cs-starting-line">
+        <span><%= status_label %></span>
+        <span class="cs-ellipsis" aria-hidden="true"><span></span><span></span><span></span></span>
+      </div>
+
+      <h3 style="font-size: 20px; margin-top: 18px;">CryoSPARC is Starting</h3>
+      <p style="font-size: 15px; color: #475569;">Please wait while CryoSPARC finishes initializing.</p>
+    </div>
+  <% end %>
+
+  <div class="cs-credits">
+    <p>
+      Created by
+      <a href="https://rci.stonybrook.edu/HPC/team/arshad-mehmood" target="_blank">A. Mehmood</a>,
+      <a href="https://rci.stonybrook.edu/HPC/team/david-carlson" target="_blank">D. Carlson</a>
+      and <a href="https://www.anthropic.com/claude" target="_blank">Claude AI</a>
+    </p>
+    <p class="cs-credits-sub">
+      Stony Brook University Research Computing · 2026
+    </p>
+  </div>
+</div>
+
+<script>
+function copyCmd() {
+  var el = document.getElementById("tunnel-cmd");
+  if (!el) return;
+
+  var cmd = el.innerText || el.textContent || "";
+  var btn = document.querySelector(".cs-btn-copy");
+  var oldText = btn ? (btn.innerText || btn.textContent) : "";
+
+  function showCopied() {
+    if (!btn) return;
+    btn.classList.add("copied");
+    btn.innerText = "Copied!";
+    setTimeout(function() {
+      btn.classList.remove("copied");
+      btn.innerText = oldText || "Copy Command";
+    }, 1500);
+  }
+
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(cmd).then(showCopied).catch(function() {
+      try {
+        var ta = document.createElement("textarea");
+        ta.value = cmd;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        showCopied();
+      } catch (e) {}
+    });
+  } else {
+    try {
+      var ta = document.createElement("textarea");
+      ta.value = cmd;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      showCopied();
+    } catch (e) {}
+  }
+}
+
+function openHelpWindow() {
+  var helpHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CryoSPARC - Help</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; background: #f1f5f9; margin: 0; padding: 20px; line-height: 1.6; color: #334155; }
+    .container { max-width: 900px; margin: 0 auto; }
+    .header { text-align: center; padding: 40px 20px; background: linear-gradient(135deg, #1e3a5f 0%, #2d5a87 100%); border-radius: 16px; margin-bottom: 30px; color: white; }
+    .header h1 { margin: 0 0 10px 0; font-size: 32px; }
+
+    .section { background: white; border-radius: 12px; margin-bottom: 20px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    .section-header { display: flex; align-items: center; gap: 14px; padding: 20px 24px; background: #f8fafc; border-bottom: 1px solid #e5e7eb; cursor: pointer; }
+    .section-header:hover { background: #f1f5f9; }
+    .section-icon { width: 40px; height: 40px; color: white; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 18px; }
+    .section-icon.blue { background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%); }
+    .section-icon.green { background: linear-gradient(135deg, #22c55e 0%, #16a34a 100%); }
+    .section-icon.orange { background: linear-gradient(135deg, #f97316 0%, #ea580c 100%); }
+
+    .section-title { flex: 1; }
+    .section-title h2 { margin: 0; font-size: 18px; color: #1e293b; }
+    .section-title p { margin: 4px 0 0 0; font-size: 14px; color: #64748b; }
+    .section-body { padding: 24px; display: none; }
+    .section.open .section-body { display: block; }
+    .section-body h3 { color: #1e293b; font-size: 16px; margin: 24px 0 12px 0; border-bottom: 2px solid #e5e7eb; padding-bottom: 8px; }
+    .section-body h3:first-child { margin-top: 0; }
+    .section-body p { color: #475569; margin: 0 0 14px 0; }
+    .section-body ul { color: #475569; padding-left: 24px; margin: 0 0 14px 0; }
+    .section-body li { margin-bottom: 8px; }
+    .code { background: #1e293b; color: #e2e8f0; padding: 14px 18px; border-radius: 8px; font-family: "SF Mono", monospace; font-size: 13px; overflow-x: auto; margin: 12px 0 16px 0; white-space: pre-wrap; word-break: break-all; }
+    .inline-code { background: #f1f5f9; padding: 2px 8px; border-radius: 4px; font-family: "SF Mono", monospace; font-size: 13px; color: #1d4ed8; }
+
+    .box { padding: 16px; border-radius: 8px; margin: 16px 0; font-size: 14px; }
+    .box.warning { background: #fffbeb; border: 1px solid #fde68a; color: #92400e; }
+
+    .footer { text-align: center; padding: 30px 20px; color: #64748b; font-size: 13px; }
+    .footer a { color: #3b82f6; text-decoration: none; font-weight: 500; }
+    .footer a:hover { text-decoration: underline; color: #2563eb; }
+
+    a { color: #2563eb; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header"><h1>🔬 CryoSPARC Help</h1></div>
+
+    <div class="section open">
+      <div class="section-header" onclick="this.parentElement.classList.toggle('open')">
+        <div class="section-icon blue"><i class="fa fa-play"></i></div>
+        <div class="section-title"><h2>Getting Started</h2><p>Quick guide</p></div>
+        <i class="fa fa-chevron-down"></i>
+      </div>
+      <div class="section-body">
+        <h3>Quick Start</h3>
+        <p>1. Get FREE academic license at <a href="https://cryosparc.com/download" target="_blank">cryosparc.com/download</a></p>
+        <p>2. Fill form and launch job</p>
+        <p>3. Wait for "Running on..." status (1-3 minutes)</p>
+        <p>4. Create SSH tunnel and open CryoSPARC</p>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-header" onclick="this.parentElement.classList.toggle('open')">
+        <div class="section-icon green"><i class="fa fa-terminal"></i></div>
+        <div class="section-title"><h2>SSH Port Forwarding</h2><p>How to connect</p></div>
+        <i class="fa fa-chevron-down"></i>
+      </div>
+      <div class="section-body">
+        <h3>Why SSH Tunnel?</h3>
+        <p>CryoSPARC runs on a compute node that isn't directly accessible. SSH port forwarding creates a secure tunnel.</p>
+
+        <h3>Generic Example</h3>
+        <div class="code">ssh -J $USER@130.245.181.10 -L PORT:localhost:PORT $USER@COMPUTE_NODE</div>
+        <p>Replace <span class="inline-code">PORT</span> and <span class="inline-code">COMPUTE_NODE</span> using values on your CryoSPARC session page.</p>
+
+        <h3>Steps</h3>
+        <p><strong>1. Open terminal</strong> on your local computer:</p>
+        <ul>
+          <li><strong>macOS:</strong> Terminal app</li>
+          <li><strong>Linux:</strong> Your terminal</li>
+          <li><strong>Windows:</strong> PowerShell or Command Prompt</li>
+        </ul>
+        <p><strong>2. Run SSH command</strong> from session page</p>
+        <div class="box warning">⚠️ <strong>Password prompts:</strong> You may need to enter your password twice (once for gateway 130.245.181.10, once for compute node)</div>
+        <p><strong>3. Keep terminal open!</strong> After password, terminal appears to hang, this is normal. Don't close it.</p>
+        <p><strong>4. Open browser</strong> to http://localhost:PORT/</p>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-header" onclick="this.parentElement.classList.toggle('open')">
+        <div class="section-icon orange"><i class="fa fa-cog"></i></div>
+        <div class="section-title"><h2>Account Management</h2><p>Passwords & users</p></div>
+        <i class="fa fa-chevron-down"></i>
+      </div>
+      <div class="section-body">
+        <h3>View Your Credentials</h3>
+        <p>Your login credentials are saved in your data directory:</p>
+        <div class="code">cat /lustre/nvwulf/scratch/$USER/cryosparc_data/credentials.txt</div>
+
+        <h3>Change Password</h3>
+        <p>SSH to compute node running CryoSPARC and run:</p>
+        <div class="code">/lustre/nvwulf/software/cryosparc/4.7.1/cryosparc_master/bin/cryosparcm resetpassword --email "your@email.com" --password "NewPass"</div>
+
+        <h3>Create Additional Users</h3>
+        <p>To add more users to your CryoSPARC instance:</p>
+        <div class="code">/lustre/nvwulf/software/cryosparc/4.7.1/cryosparc_master/bin/cryosparcm createuser \\
+  --email "colleague@email.com" \\
+  --password "TheirPassword" \\
+  --username "username" \\
+  --firstname "First" \\
+  --lastname "Last"</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-header" onclick="this.parentElement.classList.toggle('open')">
+        <div class="section-icon blue"><i class="fa fa-database"></i></div>
+        <div class="section-title"><h2>Data Persistence</h2><p>Your data across sessions</p></div>
+        <i class="fa fa-chevron-down"></i>
+      </div>
+      <div class="section-body">
+        <h3>What Persists?</h3>
+        <p>Your CryoSPARC data is <strong>fully persistent</strong> across sessions:</p>
+        <ul>
+          <li><strong>Database:</strong> All projects, jobs, and settings</li>
+          <li><strong>Projects:</strong> All project data and results</li>
+          <li><strong>User accounts:</strong> Login credentials stay the same</li>
+        </ul>
+
+        <h3>Storage Locations</h3>
+        <ul>
+          <li><strong>Data Directory:</strong> /lustre/nvwulf/scratch/$USER/cryosparc_data</li>
+          <li><strong>Projects:</strong> /lustre/nvwulf/scratch/$USER/cryosparc_projects</li>
+          <li><strong>Cache:</strong> /lustre/nvwulf/scratch/$USER/cryosparc_cache</li>
+        </ul>
+
+        <p>Your database will persist indefinitely unless you manually delete it.</p>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-header" onclick="this.parentElement.classList.toggle('open')">
+        <div class="section-icon orange"><i class="fa fa-wrench"></i></div>
+        <div class="section-title"><h2>Troubleshooting</h2><p>Common issues & fixes</p></div>
+        <i class="fa fa-chevron-down"></i>
+      </div>
+      <div class="section-body">
+        <h3>"Connection Refused" Error</h3>
+        <ul>
+          <li>Make sure SSH tunnel is active (terminal should be "hanging")</li>
+          <li>Verify correct port number from session page</li>
+          <li>Check CryoSPARC job is still running in OOD</li>
+          <li>Try recreating the SSH tunnel</li>
+        </ul>
+
+        <h3>Incorrect Password</h3>
+        <p>If password doesn't work:</p>
+        <p>1. Delete database: <span class="inline-code">rm -rf /lustre/nvwulf/scratch/$USER/cryosparc_data/database</span></p>
+        <p>2. Cancel current session in OOD</p>
+        <p>3. Start fresh session. New credentials will be created</p>
+
+        <h3>CryoSPARC Won't Start</h3>
+        <ul>
+          <li>Check job output log in OOD</li>
+          <li>Look for port conflicts. Cancel other CryoSPARC sessions</li>
+          <li>Verify license ID is correct</li>
+        </ul>
+
+        <h3>Page Stuck on "Starting"</h3>
+        <ul>
+          <li>Check job output log for errors</li>
+          <li>Wait 3-5 minutes (first-time takes longer)</li>
+          <li>Try manually refreshing page</li>
+        </ul>
+      </div>
+    </div>
+    
+    <div class="section">
+      <div class="section-header" onclick="this.parentElement.classList.toggle('open')">
+      <div class="section-icon blue"><i class="fa fa-book"></i></div>
+      <div class="section-title">
+      <h2>CryoSPARC Guide</h2>
+      <p>Official documentation</p>
+      </div>
+        <i class="fa fa-chevron-down"></i>
+      </div>
+
+      <div class="section-body">
+      <p>
+      For general information about the software platform, please see the link:
+      </p>
+      <p>
+      <a href="https://guide.cryosparc.com" target="_blank">
+        https://guide.cryosparc.com
+      </a>
+      </p>
+      </div>
+    </div>
+
+    <div class="footer">
+      Need help? Create ticket at <a href="https://iacs.supportsystem.com/" target="_blank">iacs.supportsystem.com</a>
+      <div style="margin-top: 10px;">
+        Created by
+        <a href="https://rci.stonybrook.edu/HPC/team/arshad-mehmood" target="_blank">A. Mehmood</a>,
+        <a href="https://rci.stonybrook.edu/HPC/team/david-carlson" target="_blank">D. Carlson</a>
+        and <a href="https://www.anthropic.com/claude" target="_blank">Claude AI</a>
+        · Stony Brook University Research Computing · 2026
+      </div>
+    </div>
+  </div>
+</body>
+</html>`;
+
+  var helpWindow = window.open('', '_blank', 'width=1000,height=800,scrollbars=yes,resizable=yes');
+  helpWindow.document.write(helpHTML);
+  helpWindow.document.close();
+}
+</script>
+

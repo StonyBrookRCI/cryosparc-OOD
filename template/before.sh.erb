@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+echo "=== before.sh: Setting up CryoSPARC for user ${USER} ==="
+
+# ============================================================
+# CryoSPARC Installation Path (hardcoded - no module needed)
+# ============================================================
+export CRYOSPARC_ROOT="/lustre/nvwulf/software/cryosparc/4.7.1"
+export CRYOSPARC_MASTER_DIR="${CRYOSPARC_ROOT}/cryosparc_master"
+export CRYOSPARC_WORKER_DIR="${CRYOSPARC_ROOT}/cryosparc_worker"
+
+# Verify installation exists
+if [ ! -d "${CRYOSPARC_MASTER_DIR}" ]; then
+    echo "ERROR: CryoSPARC not found at ${CRYOSPARC_MASTER_DIR}"
+    exit 1
+fi
+
+# Get hostname (must use FQDN - critical for CryoSPARC)
+HOST_FQDN="$(hostname -f 2>/dev/null || hostname --fqdn 2>/dev/null || hostname)"
+HOST_SHORT="$(hostname -s 2>/dev/null || hostname)"
+
+# Ensure we have FQDN (append domain if needed, like milan2.cm.cluster)
+if [[ "$HOST_FQDN" != *.* ]]; then
+    HOST_FQDN="${HOST_SHORT}.cm.cluster"
+fi
+
+echo "Host FQDN: ${HOST_FQDN}"
+echo "Host Short: ${HOST_SHORT}"
+
+# ============================================================
+# Per-User Unique Port Range Allocation
+# ============================================================
+# Each user gets a deterministic port range based on username hash
+# This prevents conflicts when multiple users run simultaneously
+# Range: 40000-59990 (2000 possible users, 10 ports each)
+
+get_user_base_port() {
+    local username="$1"
+    # Create a hash from username
+    local hash=$(echo -n "$username" | md5sum | cut -c1-4)
+    # Convert hex to decimal
+    local hash_int=$((16#$hash))
+    # Map to range 40000-59990 (2000 users * 10 ports each)
+    local port_offset=$((hash_int % 2000))
+    local base_port=$((40000 + (port_offset * 10)))
+    echo $base_port
+}
+
+# Get this user's assigned base port
+BASE_PORT=$(get_user_base_port "${USER}")
+
+echo ""
+echo "=============================================="
+echo "  Port Allocation for user '${USER}'"
+echo "=============================================="
+echo "  Base Port:  ${BASE_PORT}"
+echo "  Port Range: ${BASE_PORT}-$((BASE_PORT + 9))"
+echo "  Web UI:     Port ${BASE_PORT}"
+echo "  MongoDB:    Port $((BASE_PORT + 1))"
+echo "=============================================="
+echo ""
+
+# Verify ports are available on this node
+echo "Checking if ports are available on ${HOST_SHORT}..."
+PORTS_OK=true
+PORTS_IN_USE=""
+
+for offset in $(seq 0 9); do
+    port=$((BASE_PORT + offset))
+    if ss -tuln 2>/dev/null | grep -q ":${port} " || \
+       netstat -tuln 2>/dev/null | grep -q ":${port} "; then
+        echo "  WARNING: Port ${port} is in use!"
+        PORTS_OK=false
+        PORTS_IN_USE="${PORTS_IN_USE} ${port}"
+    fi
+done
+
+if [ "$PORTS_OK" = false ]; then
+    echo ""
+    echo "=============================================="
+    echo "  ERROR: Port Conflict Detected!"
+    echo "=============================================="
+    echo "  Ports in use:${PORTS_IN_USE}"
+    echo ""
+    echo "  This usually means you already have a"
+    echo "  CryoSPARC session running."
+    echo ""
+    echo "  Please stop your existing session first."
+    echo "=============================================="
+    exit 1
+fi
+
+echo "All ports available! ✓"
+
+# Save connection info for script.sh
+echo "${HOST_FQDN}" > "${PWD}/.host_fqdn"
+echo "${HOST_SHORT}" > "${PWD}/.host_short"
+echo "${BASE_PORT}" > "${PWD}/.base_port"
+
+echo ""
+echo "before.sh complete"

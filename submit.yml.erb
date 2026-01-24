@@ -1,0 +1,33 @@
+---
+batch_connect:
+  template: "basic"
+
+script:
+  wall_time: "<%= bc_num_hours.to_i * 3600 %>"
+
+  native:
+    - "--partition=<%= (queue || 'b40x4').to_s.strip %>"
+<% if memory_gb.to_s.strip == "0" %>
+    - "--mem=0"
+<% else %>
+    - "--mem=<%= memory_gb.to_s.strip %>G"
+<% end %>
+    - "--gres=gpu:<%= num_gpus.to_i %>"
+# Nodes
+    - "--nodes=1"
+
+# CPUs
+<% cpus = num_cpus.to_i %>
+<% cpus = 1 if cpus <= 0 %>
+    - "--ntasks=<%= cpus %>"
+    - "--cpus-per-task=1"
+
+    # Email notification
+<% e = email.to_s.strip %>
+<% wants_email = (bc_email_on_started.to_s == "true") %>
+<% if wants_email && !e.empty? %>
+    - "--mail-user=<%= e %>"
+    - "--mail-type=BEGIN"
+<% end %>
+
+

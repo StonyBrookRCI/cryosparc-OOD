@@ -1,0 +1,42 @@
+<%
+require "yaml"
+require "etc"
+
+def s(x); (x || "").to_s; end
+def present?(x); !s(x).strip.empty?; end
+
+uid = Process.uid
+home_dir = begin
+  Etc.getpwuid(uid).dir
+rescue
+  ENV["HOME"].to_s
+end
+
+ptr = File.join(home_dir, ".ood", "cryosparc", "active_connection_path")
+
+conn_path = nil
+begin
+  conn_path = File.read(ptr).to_s.strip if File.exist?(ptr)
+rescue
+  conn_path = nil
+end
+
+conn = {}
+begin
+  conn = YAML.safe_load(File.read(conn_path)) || {} if present?(conn_path) && File.exist?(conn_path)
+rescue
+  conn = {}
+end
+
+status = s(conn["status"])
+host   = s(conn["host"])
+port   = s(conn["port"])
+
+ready = (status == "ready") && present?(host) && present?(port)
+%>
+---
+<% if ready %>
+host: <%= host %>
+port: <%= port %>
+<% end %>
+
