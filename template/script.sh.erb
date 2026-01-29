@@ -684,6 +684,7 @@ export CRYOSPARC_DEVELOP=false
 export CRYOSPARC_INSECURE=true
 export CRYOSPARC_FORCE_HOSTNAME=true
 export CRYOSPARC_FORCE_USER=true
+export CRYOSPARC_USE_GPU=true
 EOF
 
 # Export all the environment variables
@@ -875,7 +876,40 @@ echo "Connecting worker..."
 # Status update only
 write_connection_yml "worker" "${HOST_FQDN}" "${HOST_SHORT}" "${WEB_PORT}" "${USER_DATA_DIR}" "${PROJECT_DIR}" "${GPU_COUNT}"
 sleep 2
+
+echo ""
+echo "=============================================="
+echo "  Configuring Worker on Current Node"
+echo "=============================================="
+echo "  Current node: ${HOST_FQDN}"
+echo "=============================================="
+
+cd "${MASTER_DIR}"
+
+# Get list of all registered workers and remove them
+echo "Getting list of registered workers..."
+WORKERS=$(./bin/cryosparcm cli "get_worker_nodes()" 2>/dev/null | grep -oP "'hostname':\s*'\K[^']+" || true)
+
+if [ -n "${WORKERS}" ]; then
+    echo "Removing all existing workers..."
+    for worker in ${WORKERS}; do
+        echo "  Removing: ${worker}"
+        ./bin/cryosparcm cli "remove_scheduler_target_node('${worker}')" 2>/dev/null || true
+    done
+else
+    echo "No existing workers found"
+fi
+
+sleep 2
+
+# Now connect the current node as worker
 cd "${WORKER_DIR}"
+echo ""
+echo "Connecting current node as worker: ${HOST_FQDN}"
+
+# Set required environment variable for GPU detection
+export CRYOSPARC_USE_GPU=true
+
 ./bin/cryosparcw connect \
   --worker "${HOST_FQDN}" \
   --master "${HOST_FQDN}" \
@@ -883,7 +917,7 @@ cd "${WORKER_DIR}"
   --ssdpath "${SSD_CACHE}" \
   --lane "local" \
   --gpus "${GPU_LIST}" \
-  --newlane 2>/dev/null || \
+  --newlane || \
 ./bin/cryosparcw connect \
   --worker "${HOST_FQDN}" \
   --master "${HOST_FQDN}" \
@@ -891,7 +925,35 @@ cd "${WORKER_DIR}"
   --ssdpath "${SSD_CACHE}" \
   --lane "local" \
   --gpus "${GPU_LIST}" \
-  --update 2>/dev/null || true
+  --update || true
+
+sleep 2
+
+# Verify worker is registered and show details
+cd "${MASTER_DIR}"
+echo ""
+echo "=============================================="
+echo "  Worker Registration Verification"
+echo "=============================================="
+./bin/cryosparcm cli "
+workers = get_worker_nodes()
+if workers:
+    for w in workers:
+        print(f\"  Hostname: {w.get('hostname', 'N/A')}\")
+        print(f\"  CPUs: {w.get('cpu_count', 'N/A')}\")
+        print(f\"  RAM: {w.get('ram_mb', 'N/A')} MB\")
+        gpus = w.get('gpus', [])
+        print(f\"  GPUs: {len(gpus)}\")
+        for gpu in gpus:
+            print(f\"    - {gpu.get('name', 'Unknown GPU')}\")
+        print(f\"  Cache: {w.get('cache_path', 'N/A')}\")
+else:
+    print('  WARNING: No workers registered!')
+" 2>/dev/null || echo "  Could not retrieve worker info"
+echo "=============================================="
+
+echo ""
+echo "Worker configured: ${HOST_FQDN}"
 
 # Return to ready for UI
 write_connection_yml "ready" "${HOST_FQDN}" "${HOST_SHORT}" "${WEB_PORT}" "${USER_DATA_DIR}" "${PROJECT_DIR}" "${GPU_COUNT}"
