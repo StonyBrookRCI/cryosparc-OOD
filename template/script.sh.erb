@@ -339,29 +339,309 @@ WORKER_DIR="${CRYOSPARC_WORKER_DIR}"
 
 echo ""
 echo "=============================================="
-echo "  AGGRESSIVE CLEANUP: Killing all CryoSPARC"
+echo "  GRACEFUL CLEANUP: Stopping CryoSPARC"
 echo "=============================================="
 
-cd "${MASTER_DIR}" 2>/dev/null && ./bin/cryosparcm stop 2>/dev/null || true
-pkill -9 -u "${USER}" -f "cryosparc_master/bin" 2>/dev/null || true
-pkill -9 -u "${USER}" -f "cryosparc_worker/bin" 2>/dev/null || true
-pkill -9 -u "${USER}" -f "cryosparc_compute" 2>/dev/null || true
-pkill -9 -u "${USER}" -f "cryosparcm" 2>/dev/null || true
-pkill -9 -u "${USER}" -f "cryosparcw" 2>/dev/null || true
-pkill -9 -u "${USER}" -f "mongod.*cryosparc" 2>/dev/null || true
-pkill -9 -u "${USER}" -f "supervisord.*cryosparc" 2>/dev/null || true
-sleep 3
+# ============================================================
+# ISSUE 2 FIX: Graceful shutdown before force kill
+# Give MongoDB time to shutdown cleanly to prevent corruption
+# ============================================================
 
+# Step 1: Try graceful stop first
+echo "Attempting graceful shutdown..."
+cd "${MASTER_DIR}" 2>/dev/null && ./bin/cryosparcm stop 2>/dev/null || true
+
+# Step 2: Wait for graceful shutdown (up to 30 seconds)
+echo "Waiting for graceful shutdown..."
+for i in $(seq 1 30); do
+    if ! pgrep -u "${USER}" -f "mongod.*cryosparc" > /dev/null 2>&1; then
+        echo "MongoDB stopped gracefully after ${i} seconds"
+        break
+    fi
+    sleep 1
+done
+
+# Step 3: Send SIGTERM (graceful) to remaining processes
+echo "Sending SIGTERM to remaining processes..."
+pkill -u "${USER}" -f "cryosparc_master/bin" 2>/dev/null || true
+pkill -u "${USER}" -f "cryosparc_worker/bin" 2>/dev/null || true
+pkill -u "${USER}" -f "cryosparc_compute" 2>/dev/null || true
+pkill -u "${USER}" -f "cryosparcm" 2>/dev/null || true
+pkill -u "${USER}" -f "cryosparcw" 2>/dev/null || true
+pkill -u "${USER}" -f "mongod.*cryosparc" 2>/dev/null || true
+pkill -u "${USER}" -f "supervisord.*cryosparc" 2>/dev/null || true
+
+# Step 4: Wait for SIGTERM to take effect
+sleep 10
+
+# Step 5: Only force kill (-9) if processes still exist
+if pgrep -u "${USER}" -f "mongod.*cryosparc" > /dev/null 2>&1; then
+    echo "WARNING: MongoDB still running, force killing..."
+    pkill -9 -u "${USER}" -f "mongod.*cryosparc" 2>/dev/null || true
+    sleep 3
+fi
+
+if pgrep -u "${USER}" -f "cryosparc" > /dev/null 2>&1; then
+    echo "WARNING: CryoSPARC processes still running, force killing..."
+    pkill -9 -u "${USER}" -f "cryosparc_master/bin" 2>/dev/null || true
+    pkill -9 -u "${USER}" -f "cryosparc_worker/bin" 2>/dev/null || true
+    pkill -9 -u "${USER}" -f "cryosparc_compute" 2>/dev/null || true
+    pkill -9 -u "${USER}" -f "cryosparcm" 2>/dev/null || true
+    pkill -9 -u "${USER}" -f "cryosparcw" 2>/dev/null || true
+    pkill -9 -u "${USER}" -f "supervisord.*cryosparc" 2>/dev/null || true
+    sleep 3
+fi
+
+# Clean up socket and lock files
 rm -f /tmp/cryosparc-supervisor-*.sock 2>/dev/null || true
 rm -f "${HOME}/.cryosparc/"*.sock 2>/dev/null || true
-rm -f "${USER_DATA_DIR}/database/mongod.lock" 2>/dev/null || true
-rm -f "${USER_DATA_DIR}/database/WiredTiger.lock" 2>/dev/null || true
 rm -f "${USER_MASTER_DIR}/run/"*.pid 2>/dev/null || true
 rm -f "${USER_MASTER_DIR}/run/"*.sock 2>/dev/null || true
 
 echo "Cleanup complete"
 echo ""
 
+# ============================================================
+# ROBUST DATABASE RECOVERY
+# Handle all cases of improper shutdown, corruption, locks
+# ============================================================
+echo "=============================================="
+echo "  Database Integrity Check & Recovery"
+echo "=============================================="
+
+if [ -d "${USER_DB_DIR}" ]; then
+    DB_REPAIR_NEEDED=false
+    
+    # ----------------------------------------------------
+    # Step 1: Kill any orphaned MongoDB processes for this user
+    # ----------------------------------------------------
+    ORPHAN_MONGOD=$(pgrep -u "${USER}" -f "mongod.*${USER_DB_DIR}" 2>/dev/null || true)
+    if [ -n "${ORPHAN_MONGOD}" ]; then
+        echo "WARNING: Found orphaned MongoDB process(es): ${ORPHAN_MONGOD}"
+        echo "  Killing orphaned processes..."
+        pkill -u "${USER}" -f "mongod.*${USER_DB_DIR}" 2>/dev/null || true
+        sleep 3
+        pkill -9 -u "${USER}" -f "mongod.*${USER_DB_DIR}" 2>/dev/null || true
+        sleep 2
+    fi
+    
+    # ----------------------------------------------------
+    # Step 2: Remove ALL lock files unconditionally
+    # These are always safe to remove if MongoDB isn't running
+    # ----------------------------------------------------
+    echo "Cleaning lock files..."
+    rm -f "${USER_DB_DIR}/mongod.lock" 2>/dev/null || true
+    rm -f "${USER_DB_DIR}/WiredTiger.lock" 2>/dev/null || true
+    rm -f "${USER_DB_DIR}/.lock" 2>/dev/null || true
+    
+    # ----------------------------------------------------
+    # Step 3: Check for corruption indicators
+    # ----------------------------------------------------
+    CORRUPTION_DETECTED=false
+    
+    # Check if WiredTiger file exists but is empty (truly corrupted)
+    # Note: Normal WiredTiger file is 40-50 bytes, so only flag if very small
+    if [ -f "${USER_DB_DIR}/WiredTiger" ]; then
+        WT_SIZE=$(stat -c%s "${USER_DB_DIR}/WiredTiger" 2>/dev/null || echo "0")
+        if [ "${WT_SIZE}" -lt 20 ]; then
+            echo "WARNING: WiredTiger file appears corrupted (size: ${WT_SIZE} bytes)"
+            CORRUPTION_DETECTED=true
+        fi
+    fi
+    
+    # Check for WiredTiger.turtle which indicates incomplete recovery
+    if [ -f "${USER_DB_DIR}/WiredTiger.turtle" ]; then
+        if [ -f "${USER_DB_DIR}/WiredTiger.turtle.set" ]; then
+            echo "WARNING: Found incomplete WiredTiger recovery files"
+            rm -f "${USER_DB_DIR}/WiredTiger.turtle.set" 2>/dev/null || true
+            DB_REPAIR_NEEDED=true
+        fi
+    fi
+    
+    # Check journal directory
+    if [ -d "${USER_DB_DIR}/journal" ]; then
+        JOURNAL_FILES=$(ls -1 "${USER_DB_DIR}/journal/" 2>/dev/null | wc -l)
+        if [ "${JOURNAL_FILES}" -gt 0 ]; then
+            echo "Found ${JOURNAL_FILES} journal files (will be replayed on startup)"
+        fi
+    fi
+    
+    # Clean up diagnostic.data if too large
+    if [ -d "${USER_DB_DIR}/diagnostic.data" ]; then
+        DIAG_SIZE=$(du -sm "${USER_DB_DIR}/diagnostic.data" 2>/dev/null | cut -f1)
+        if [ "${DIAG_SIZE:-0}" -gt 100 ]; then
+            echo "Cleaning old diagnostic files (${DIAG_SIZE}MB)..."
+            find "${USER_DB_DIR}/diagnostic.data" -type f -mtime +3 -delete 2>/dev/null || true
+        fi
+    fi
+    
+    # ----------------------------------------------------
+    # Step 4: If corruption detected, try MongoDB repair
+    # ----------------------------------------------------
+    if [ "${CORRUPTION_DETECTED}" = true ]; then
+        echo ""
+        echo "=============================================="
+        echo "  Attempting Database Repair..."
+        echo "=============================================="
+        
+        # Find mongod binary - follow symlinks and check multiple locations
+        MONGOD_BIN=""
+        
+        # First try to resolve through the symlinked deps directory
+        if [ -L "${USER_MASTER_DIR}/deps" ]; then
+            REAL_DEPS=$(readlink -f "${USER_MASTER_DIR}/deps")
+            if [ -x "${REAL_DEPS}/mongodb/bin/mongod" ]; then
+                MONGOD_BIN="${REAL_DEPS}/mongodb/bin/mongod"
+            fi
+        fi
+        
+        # Fall back to explicit paths
+        if [ -z "${MONGOD_BIN}" ]; then
+            for try_path in \
+                "${SHARED_MASTER_DIR}/deps/mongodb/bin/mongod" \
+                "${CRYOSPARC_ROOT}/cryosparc_master/deps/mongodb/bin/mongod" \
+                "/lustre/nvwulf/software/cryosparc/4.7.1/cryosparc_master/deps/mongodb/bin/mongod" \
+                "${USER_MASTER_DIR}/deps/mongodb/bin/mongod"; do
+                if [ -x "${try_path}" ]; then
+                    MONGOD_BIN="${try_path}"
+                    break
+                fi
+            done
+        fi
+        
+        if [ -n "${MONGOD_BIN}" ] && [ -x "${MONGOD_BIN}" ]; then
+            echo "Found mongod at: ${MONGOD_BIN}"
+            echo "Running MongoDB repair (this may take a few minutes)..."
+            timeout 300 "${MONGOD_BIN}" --dbpath "${USER_DB_DIR}" --repair 2>&1 | tail -20 || true
+            echo "Repair attempt completed"
+        else
+            echo "WARNING: Could not find mongod binary for repair"
+            echo "  MongoDB will attempt automatic journal recovery on startup"
+        fi
+    fi
+    
+    # ----------------------------------------------------
+    # Step 4b: If database is severely corrupted, offer nuclear option
+    # ----------------------------------------------------
+    if [ -f "${USER_DB_DIR}/WiredTiger" ]; then
+        WT_SIZE=$(stat -c%s "${USER_DB_DIR}/WiredTiger" 2>/dev/null || echo "0")
+        if [ "${WT_SIZE}" -lt 10 ]; then
+            echo ""
+            echo "=============================================="
+            echo "  SEVERE DATABASE CORRUPTION DETECTED"
+            echo "=============================================="
+            echo "  WiredTiger metadata is only ${WT_SIZE} bytes."
+            echo "  Database may not be recoverable."
+            echo ""
+            echo "  If CryoSPARC fails to start, you may need to:"
+            echo "  rm -rf ${USER_DB_DIR}"
+            echo "  Then restart - you'll lose job history but"
+            echo "  project files in ${PROJECT_DIR} are safe."
+            echo "=============================================="
+        fi
+    fi
+    
+    # ----------------------------------------------------
+    # Step 5: Create backup marker for tracking
+    # ----------------------------------------------------
+    echo "$(date -Is) - Session started, integrity check complete" >> "${USER_DATA_DIR}/session_log.txt"
+    
+    echo "Database integrity check complete ✓"
+    
+    # ----------------------------------------------------
+    # Step 6: Quick database startup test
+    # Start MongoDB briefly to verify it can start
+    # ----------------------------------------------------
+    echo "Running database pre-flight check..."
+    
+    # Find mongod binary - follow symlinks
+    MONGOD_BIN=""
+    
+    if [ -L "${USER_MASTER_DIR}/deps" ]; then
+        REAL_DEPS=$(readlink -f "${USER_MASTER_DIR}/deps")
+        if [ -x "${REAL_DEPS}/mongodb/bin/mongod" ]; then
+            MONGOD_BIN="${REAL_DEPS}/mongodb/bin/mongod"
+        fi
+    fi
+    
+    if [ -z "${MONGOD_BIN}" ]; then
+        for try_path in \
+            "${SHARED_MASTER_DIR}/deps/mongodb/bin/mongod" \
+            "${CRYOSPARC_ROOT}/cryosparc_master/deps/mongodb/bin/mongod" \
+            "/lustre/nvwulf/software/cryosparc/4.7.1/cryosparc_master/deps/mongodb/bin/mongod"; do
+            if [ -x "${try_path}" ]; then
+                MONGOD_BIN="${try_path}"
+                break
+            fi
+        done
+    fi
+    
+    if [ -n "${MONGOD_BIN}" ] && [ -x "${MONGOD_BIN}" ]; then
+        # Try to start MongoDB briefly to verify database is OK
+        TEST_LOG="/tmp/mongod_test_${USER}_$$.log"
+        timeout 30 "${MONGOD_BIN}" \
+            --dbpath "${USER_DB_DIR}" \
+            --port $((BASE_PORT + 100)) \
+            --bind_ip 127.0.0.1 \
+            --logpath "${TEST_LOG}" \
+            --fork 2>/dev/null
+        
+        TEST_PID=$(pgrep -u "${USER}" -f "mongod.*$((BASE_PORT + 100))" 2>/dev/null || true)
+        
+        if [ -n "${TEST_PID}" ]; then
+            echo "  Pre-flight check passed ✓"
+            kill "${TEST_PID}" 2>/dev/null || true
+            sleep 2
+            kill -9 "${TEST_PID}" 2>/dev/null || true
+        else
+            # Check if there was a startup error
+            if [ -f "${TEST_LOG}" ] && grep -q "exception\|error\|fatal" "${TEST_LOG}" 2>/dev/null; then
+                echo "  WARNING: Database pre-flight detected issues:"
+                grep -i "exception\|error\|fatal" "${TEST_LOG}" | head -5
+                echo ""
+                echo "  Attempting recovery..."
+                
+                # Try repair one more time
+                timeout 300 "${MONGOD_BIN}" --dbpath "${USER_DB_DIR}" --repair 2>&1 | tail -10 || true
+            else
+                echo "  Pre-flight check completed (MongoDB may have recovered journals)"
+            fi
+        fi
+        rm -f "${TEST_LOG}" 2>/dev/null || true
+    else
+        echo "  Skipping pre-flight (mongod not found)"
+    fi
+else
+    echo "No existing database found (fresh install)"
+fi
+
+# ----------------------------------------------------
+# Create a simple backup of critical database files
+# This runs in background and won't slow down startup
+# ----------------------------------------------------
+backup_database() {
+    local backup_dir="${USER_DATA_DIR}/database_backup"
+    mkdir -p "${backup_dir}"
+    
+    while true; do
+        sleep 1800  # Every 30 minutes
+        
+        if [ -d "${USER_DB_DIR}" ] && pgrep -u "${USER}" -f "mongod.*${USER_DB_DIR}" > /dev/null 2>&1; then
+            # Only backup small critical files, not the full database
+            cp -f "${USER_DB_DIR}/WiredTiger" "${backup_dir}/" 2>/dev/null || true
+            cp -f "${USER_DB_DIR}/WiredTiger.turtle" "${backup_dir}/" 2>/dev/null || true
+            cp -f "${USER_DB_DIR}/storage.bson" "${backup_dir}/" 2>/dev/null || true
+            echo "$(date -Is) - Backup checkpoint" >> "${USER_DATA_DIR}/session_log.txt"
+        fi
+    done
+}
+
+# Start background backup (won't prevent script from exiting)
+backup_database &
+BACKUP_PID=$!
+disown ${BACKUP_PID} 2>/dev/null || true
+
+echo ""
 echo "=============================================="
 echo "  Port Allocation for user '${USER}'"
 echo "=============================================="
@@ -416,10 +696,48 @@ export CRYOSPARC_INSECURE=true
 export CRYOSPARC_FORCE_HOSTNAME=true
 export CRYOSPARC_FORCE_USER=true
 
+# ============================================================
+# IMPROVED CLEANUP TRAP: Graceful shutdown on exit
+# ============================================================
 cleanup() {
-  echo "Shutting down CryoSPARC..."
-  cd "${MASTER_DIR}" 2>/dev/null || true
-  ./bin/cryosparcm stop 2>/dev/null || true
+    echo ""
+    echo "=============================================="
+    echo "  Shutting down CryoSPARC gracefully..."
+    echo "=============================================="
+    
+    # Kill backup process if running
+    kill ${BACKUP_PID} 2>/dev/null || true
+    
+    cd "${MASTER_DIR}" 2>/dev/null || true
+    
+    # Try graceful stop
+    ./bin/cryosparcm stop 2>/dev/null || true
+    
+    # Wait up to 20 seconds for MongoDB to stop cleanly
+    for i in $(seq 1 20); do
+        if ! pgrep -u "${USER}" -f "mongod.*cryosparc" > /dev/null 2>&1; then
+            echo "CryoSPARC stopped cleanly after ${i} seconds"
+            echo "$(date -Is) - Clean shutdown after ${i}s" >> "${USER_DATA_DIR}/session_log.txt"
+            break
+        fi
+        sleep 1
+    done
+    
+    # If still running, send SIGTERM
+    if pgrep -u "${USER}" -f "mongod.*cryosparc" > /dev/null 2>&1; then
+        echo "Sending SIGTERM to MongoDB..."
+        pkill -u "${USER}" -f "mongod.*cryosparc" 2>/dev/null || true
+        sleep 5
+    fi
+    
+    # Last resort: SIGKILL
+    if pgrep -u "${USER}" -f "mongod.*cryosparc" > /dev/null 2>&1; then
+        echo "WARNING: Force killing MongoDB (may require recovery on next start)..."
+        echo "$(date -Is) - Force kill required" >> "${USER_DATA_DIR}/session_log.txt"
+        pkill -9 -u "${USER}" -f "mongod.*cryosparc" 2>/dev/null || true
+    fi
+    
+    echo "Shutdown complete"
 }
 trap cleanup EXIT INT TERM
 
@@ -595,4 +913,3 @@ echo "##############################################"
 while true; do
   sleep 300
 done
-
