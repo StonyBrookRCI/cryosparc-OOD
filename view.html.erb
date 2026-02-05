@@ -484,7 +484,58 @@ function openHelpWindow() {
         </ul>
       </div>
     </div>
-    
+
+    <div class="section">
+      <div class="section-header" onclick="this.parentElement.classList.toggle('open')">
+        <div class="section-icon green"><i class="fa fa-crosshairs"></i></div>
+        <div class="section-title"><h2>Topaz Integration</h2><p>Deep learning particle picking</p></div>
+        <i class="fa fa-chevron-down"></i>
+      </div>
+      <div class="section-body">
+        <h3>What is Topaz?</h3>
+        <p>Topaz is a <strong>deep learning-based particle picking</strong> pipeline for cryo-EM. It uses convolutional neural networks trained from positive and unlabeled examples, and also includes micrograph/tomogram denoising capabilities.</p>
+
+        <h3>Installation Details</h3>
+        <ul>
+          <li><strong>Version:</strong> 0.3.17</li>
+          <li><strong>Executable Path:</strong> <span class="inline-code">/lustre/nvwulf/software/topaz/0.3.17/env/bin/topaz</span></li>
+          <li><strong>PyTorch:</strong> GPU-enabled with CUDA 12.4 support</li>
+          <li><strong>Python:</strong> 3.10</li>
+        </ul>
+
+        <h3>Features</h3>
+        <ul>
+          <li><strong>GPU Accelerated:</strong> Full PyTorch CUDA support for NVIDIA GPUs</li>
+          <li><strong>Particle Picking:</strong> CNN-based detection from positive/unlabeled examples</li>
+          <li><strong>Denoising:</strong> Deep denoising for micrographs (2D) and tomograms (3D)</li>
+          <li><strong>Pretrained Models:</strong> Includes pretrained picking and denoising models</li>
+          <li><strong>CryoSPARC Integration:</strong> Works directly with CryoSPARC Deep Picker jobs</li>
+        </ul>
+
+        <h3>Using Topaz in CryoSPARC</h3>
+        <p>When configuring Topaz in CryoSPARC, use this path:</p>
+        <p><span class="inline-code">/lustre/nvwulf/software/topaz/0.3.17/env/bin/topaz</span></p>
+
+        <h3>Standalone Usage (Outside CryoSPARC)</h3>
+        <p>To use Topaz from the command line:</p>
+        <p><span class="inline-code">module load topaz/0.3.17</span></p>
+        <p>This automatically loads miniconda and sets up the environment. Then run:</p>
+        <ul>
+          <li><span class="inline-code">topaz --help</span> - View all commands</li>
+          <li><span class="inline-code">topaz preprocess</span> - Downsample and normalize micrographs</li>
+          <li><span class="inline-code">topaz train</span> - Train a picking model</li>
+          <li><span class="inline-code">topaz extract</span> - Extract particle coordinates</li>
+          <li><span class="inline-code">topaz denoise</span> - Denoise micrographs</li>
+        </ul>
+
+        <h3>Documentation</h3>
+        <ul>
+          <li><a href="https://github.com/tbepler/topaz" target="_blank">Topaz GitHub</a></li>
+          <li><a href="https://guide.cryosparc.com/processing-data/all-job-types-in-cryosparc/deep-picking/topaz" target="_blank">CryoSPARC Topaz Integration Guide</a></li>
+        </ul>
+      </div>
+    </div>    
+
     <div class="section">
       <div class="section-header" onclick="this.parentElement.classList.toggle('open')">
       <div class="section-icon blue"><i class="fa fa-book"></i></div>
@@ -526,4 +577,3 @@ function openHelpWindow() {
   helpWindow.document.close();
 }
 </script>
-
