@@ -422,7 +422,7 @@ function openHelpWindow() {
       </div>
     </div>
 
-    <div class="section">
+<div class="section">
       <div class="section-header" onclick="this.parentElement.classList.toggle('open')">
         <div class="section-icon blue"><i class="fa fa-database"></i></div>
         <div class="section-title"><h2>Data Persistence</h2><p>Your data across sessions</p></div>
@@ -436,15 +436,26 @@ function openHelpWindow() {
           <li><strong>Projects:</strong> All project data and results</li>
           <li><strong>User accounts:</strong> Login credentials stay the same</li>
         </ul>
-
         <h3>Storage Locations</h3>
         <ul>
           <li><strong>Data Directory:</strong> /lustre/nvwulf/scratch/$USER/cryosparc_data</li>
           <li><strong>Projects:</strong> /lustre/nvwulf/scratch/$USER/cryosparc_projects</li>
           <li><strong>Cache:</strong> /lustre/nvwulf/scratch/$USER/cryosparc_cache</li>
         </ul>
-
+        <div class="warning-box" style="background: #fff3cd; border-left: 4px solid #ffc107; padding: 12px 16px; border-radius: 6px; margin: 16px 0;">
+          <p style="margin: 0 0 8px 0; font-weight: 600; color: #856404;"><i class="fa fa-exclamation-triangle"></i> &nbsp;Warning — Scratch Storage</p>
+          <p style="margin: 0; color: #664d03; font-size: 0.95em;">The paths above point to <strong>/scratch</strong> and are intended <strong>only for testing purposes</strong>. It is strongly recommended that you set your <strong>Data Directory</strong> and <strong>Projects</strong> paths to your permanent project directory. Using scratch storage can result in <strong>non-functioning of CryoSPARC after the first run</strong> due to NVwulf's scratch deletion policy, which automatically purges old files.</p>
+        </div>
         <p>Your database will persist indefinitely unless you manually delete it.</p>
+
+        <h3>Moving Data Directory</h3>
+        <p>If you need to relocate your Data Directory from one location to another (e.g., from scratch to a permanent project directory), you can copy it using the following command:</p>
+        <div class="code">rsync -a /Full_Path/to/old/location/cryosparc_data/ \
+  /Full_Path/to/new/location/cryosparc_data/</div>
+        <p>For example, to move from scratch to your project directory:</p>
+        <div class="code">rsync -a /lustre/nvwulf/scratch/$USER/cryosparc_data/ \
+  /lustre/nvwulf/projects/$USERGroup-nvwulf/cryosparc_data/</div>
+        <p style="margin-top: 8px; font-size: 0.93em; color: #555;"><i class="fa fa-info-circle"></i> &nbsp;After moving, make sure to update the Data Directory path in your CryoSPARC Open OnDemad form to point to the new location.</p>
       </div>
     </div>
 
@@ -577,3 +588,4 @@ function openHelpWindow() {
   helpWindow.document.close();
 }
 </script>
+
